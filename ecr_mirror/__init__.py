@@ -10,6 +10,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 
+from mypy_boto3_ecr_public import ECRPublicClient
 from mypy_boto3_ecr import ECRClient
 from concurrent.futures import ThreadPoolExecutor
 from mypy_boto3_ecr.type_defs import RepositoryTypeDef
@@ -17,7 +18,7 @@ from mypy_boto3_ecr.type_defs import RepositoryTypeDef
 
 @dataclass()
 class Context:
-    client: ECRClient
+    client: ECRPublicClient | ECRClient
     registry_id: str
     override_os: str
     override_arch: str
@@ -33,7 +34,7 @@ class MirroredRepo:
 
 @click.group()
 @click.option(
-    "--registry-id", help="The registry ID. This is usually your AWS account ID."
+    "--registry-id", '--reg', required=True, help="The registry ID. This is usually your AWS account ID."
 )
 @click.option("--role-arn", help="Assume a specific role to push to AWS")
 @click.option(
@@ -41,12 +42,13 @@ class MirroredRepo:
 )
 @click.option(
     "--override-arch",
+    type=click.Choice(['amd64', 'arm64', 'windows-amd64', 'all']),
     default="amd64",
     help="Specify the ARCH of images, default to \"amd64\". If set to \"all\" - all architectures will be synced"
 )
 @click.pass_context
 def cli(ctx, registry_id, role_arn, override_os, override_arch):
-    client = boto3.client("ecr")
+    client = boto3.client("ecr-public")
     # Assume a role, if required:
     if role_arn:
         click.echo("Assuming role...")
@@ -59,7 +61,7 @@ def cli(ctx, registry_id, role_arn, override_os, override_arch):
         tmp_secret_key = assume_role_object["SecretAccessKey"]
         security_token = assume_role_object["SessionToken"]
         client = boto3.client(
-            "ecr",
+            "ecr-public",
             aws_access_key_id=tmp_access_key,
             aws_secret_access_key=tmp_secret_key,
             aws_session_token=security_token,
@@ -116,19 +118,19 @@ def list_repos(ctx):
             click.secho(f"  tags: {repo.upstream_tags}", fg="yellow")
 
 
-def ecr_login(client: ECRClient, registry_id: str) -> str:
+def ecr_login(client: ECRPublicClient | ECRClient, registry_id: str) -> str:
     """
     Authenticate with ECR, returning a `username:password` pair
     """
-    auth_response = client.get_authorization_token(registryIds=[registry_id])
+    auth_response = client.get_authorization_token()
     return base64.decodebytes(
-        auth_response["authorizationData"][0]["authorizationToken"].encode()
+        auth_response["authorizationData"]["authorizationToken"].encode()
     ).decode()
 
 
 @click.pass_context
 def copy_repositories(
-    ctx, client: ECRClient, registry_id: str, repositories: List[MirroredRepo]
+    ctx, client: ECRPublicClient | ECRClient, registry_id: str, repositories: List[MirroredRepo]
 ):
     """
     Perform the actual, concurrent copy of the images
@@ -166,6 +168,8 @@ def copy_image(ctx: Context, source_image, dest_image, token, sleep_time):
     args = [
         "skopeo",
         "copy",
+        "--src-creds=grizmin:tainoobichamazis17:)",
+        f"--dest-creds={token}",
         f"docker://{source_image}",
         f"docker://{dest_image}",
         f"--override-os={ctx.override_os}",
@@ -174,9 +178,8 @@ def copy_image(ctx: Context, source_image, dest_image, token, sleep_time):
         args = args + [f"--multi-arch=all"]
     else:
         args = args + [f"--override-arch={ctx.override_arch}"]
-    args_with_creds = args + [f"--dest-creds={token}"]
     try:
-        subprocess.check_output(args_with_creds, stderr=subprocess.STDOUT)
+        subprocess.check_output(args, stderr=subprocess.STDOUT)
     except subprocess.CalledProcessError as e:
         click.secho(f'{" ".join(args)} raised an error: {e.returncode}', fg="red")
         click.secho(f"Last output: {e.output[100:]}", fg="red")
@@ -219,7 +222,7 @@ def find_tags_to_copy(ctx, image_name, tag_patterns, ignore_tags):
     )
 
 
-def find_repositories(client: ECRClient, registry_id: str):
+def find_repositories(client: ECRPublicClient | ECRClient, registry_id: str):
     """
     List all ECR repositories that have an `upstream-image` tag set.
     """
@@ -250,3 +253,7 @@ def find_repositories(client: ECRClient, registry_id: str):
         for item in pool.map(filter_repo, all_repositories):
             if item is not None:
                 yield item
+
+if __name__ == "__main__":
+    cli()
+    sys.exit(0)
