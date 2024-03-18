@@ -6,6 +6,7 @@ import base64
 import fnmatch
 import json
 import boto3
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -22,6 +23,13 @@ class Context:
     registry_id: str
     override_os: str
     override_arch: str
+    verbose: bool
+    dry_run: bool
+    debug: bool
+    public: bool
+    docker_username: str
+    docker_password: str
+    threads: int
 
 
 @dataclass()
@@ -36,7 +44,7 @@ class MirroredRepo:
 @click.option(
     "--registry-id", '--reg', required=True, help="The registry ID. This is usually your AWS account ID."
 )
-@click.option("--role-arn", help="Assume a specific role to push to AWS")
+@click.option("--role-name", help="Assume a specific role to push to AWS")
 @click.option(
     "--override-os", default="linux", help="Specify the OS of images, default to \"linux\""
 )
@@ -46,31 +54,74 @@ class MirroredRepo:
     default="amd64",
     help="Specify the ARCH of images, default to \"amd64\". If set to \"all\" - all architectures will be synced"
 )
+@click.option("--profile-name", help="The name of the AWS profile to use")
+@click.option("--verbose", is_flag=True, help="Enable verbose output")
+@click.option("--dry-run", is_flag=True, help="Enable dry run")
+@click.option("--debug", is_flag=True, help="Enable debug output")
+@click.option('--public', is_flag=True, help="Use ECR Public instead of ECR")
+@click.option('--docker-username', help="The username to use for docker login")
+@click.option('--docker-password', help="The password to use for docker login")
+@click.option('--threads', default=5, help="The number of threads to use for copying images")
 @click.pass_context
-def cli(ctx, registry_id, role_arn, override_os, override_arch):
-    client = boto3.client("ecr-public")
-    # Assume a role, if required:
-    if role_arn:
-        click.echo("Assuming role...")
-        sts_connection = boto3.client("sts")
-        assume_role_object = sts_connection.assume_role(
-            RoleArn=role_arn, RoleSessionName=f"ecr-mirror", DurationSeconds=3600
-        )["Credentials"]
-
-        tmp_access_key = assume_role_object["AccessKeyId"]
-        tmp_secret_key = assume_role_object["SecretAccessKey"]
-        security_token = assume_role_object["SessionToken"]
-        client = boto3.client(
-            "ecr-public",
-            aws_access_key_id=tmp_access_key,
-            aws_secret_access_key=tmp_secret_key,
-            aws_session_token=security_token,
+def cli(
+    ctx,
+    registry_id,
+    profile_name,
+    role_name,
+    override_os,
+    override_arch,
+    public,
+    verbose,
+    dry_run,
+    debug,
+    docker_username,
+    docker_password,
+    threads
+    ):
+    
+    service_name = "ecr" if not public else "ecr-public"
+    
+    # Authenticate
+    if not profile_name:
+        print("No profile name specified. Falling back to environment variables.")
+        if 'AWS_ACCESS_KEY_ID' not in os.environ:
+            raise Exception("No AWS_ACCESS_KEY_ID environment variable set. Please set credentials or use Profile name.")
+        my_session = boto3.Session(
+            aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
+            aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'],
+            aws_session_token=os.environ['AWS_SESSION_TOKEN']
         )
+    else: 
+        my_session = boto3.session.Session(profile_name=profile_name)
+
+    # Assume the desired role
+    if role_name:
+        print(f"Assuming role {role_name}")
+        sts_connection = my_session.client('sts')
+        account_id = sts_connection.get_caller_identity()["Account"]
+        assumed_role_object = sts_connection.assume_role(
+            RoleArn=f"arn:aws:iam::{account_id}:role/{role_name}",
+            RoleSessionName=f"ecr-mirror{role_name}@{account_id}"
+        )["Credentials"]
+        my_session = boto3.Session(
+            aws_access_key_id=assumed_role_object["AccessKeyId"],
+            aws_secret_access_key=assumed_role_object["SecretAccessKey"],
+            aws_session_token=assumed_role_object["SessionToken"]
+        )
+    client = my_session.client(service_name)
+        
     ctx.obj = Context(
         client=client,
         registry_id=registry_id,
         override_os=override_os,
         override_arch=override_arch,
+        verbose=verbose,
+        dry_run=dry_run,
+        debug=debug,
+        public=public,
+        docker_username=docker_username,
+        docker_password=docker_password,
+        threads=threads
     )
 
 
@@ -78,7 +129,7 @@ def cli(ctx, registry_id, role_arn, override_os, override_arch):
 @click.pass_context
 def sync(ctx):
     """
-    Copy public images to ECR using ECR tags
+    Synchronize public images to ECR using ECR tags. Image tags, that are not already in the destination repository will be copied.
     """
     repositories = find_repositories(ctx.obj.client, ctx.obj.registry_id)
     copy_repositories(ctx.obj.client, ctx.obj.registry_id, list(repositories))
@@ -118,14 +169,17 @@ def list_repos(ctx):
             click.secho(f"  tags: {repo.upstream_tags}", fg="yellow")
 
 
-def ecr_login(client: ECRPublicClient | ECRClient, registry_id: str) -> str:
+@click.pass_context
+def ecr_login(ctx, client: ECRPublicClient | ECRClient, registry_id: str) -> str:
     """
     Authenticate with ECR, returning a `username:password` pair
     """
-    auth_response = client.get_authorization_token()
-    return base64.decodebytes(
-        auth_response["authorizationData"]["authorizationToken"].encode()
-    ).decode()
+    if ctx.obj.public:
+        auth_response = client.get_authorization_token()["authorizationData"]["authorizationToken"].encode()
+    else:
+        auth_response = client.get_authorization_token(registryIds=[registry_id])["authorizationData"][0]["authorizationToken"].encode()
+        
+    return base64.decodebytes(auth_response).decode()
 
 
 @click.pass_context
@@ -137,14 +191,34 @@ def copy_repositories(
     """
     token = ecr_login(client, registry_id)
     click.echo("Finding all tags to copy...")
+    
+    # destination repository tags. This is a dictionary with the key being the repository uri and the value being a list of tags
+    destination_tags = {repo.repository_uri: get_repo_tags(repo.repository_uri) for repo in repositories}
+        
     items = [
         (repo, tag)
         for repo in repositories
         for tag in find_tags_to_copy(repo.upstream_image, repo.upstream_tags, repo.ignore_tags)
     ]
-    click.echo(f"Beginning the copy of {len(items)} images")
+    
+    items_to_copy = []
+    
+    # remove items that are exist in the destination repository
+    for item in items:
+        if item[0].repository_uri in destination_tags:
+            if item[1] in destination_tags[item[0].repository_uri]:
+                pass
+                click.echo(f"Removing {item[1]} from list of tags to copy") if ctx.obj.verbose else None
+            else:
+                items_to_copy.append(item)
+    
+    if items_to_copy:   
+        click.echo(f"Beginning the copy of {len(items_to_copy)} images")
+    else:
+        click.echo("No images to copy")
+        return
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=ctx.obj.threads) as pool:
         # This code aint' beautiful, but whatever 🤷‍
         pool.map(
             lambda item: copy_image(
@@ -154,8 +228,24 @@ def copy_repositories(
                 token,
                 sleep_time=1,
             ),
-            items,
+            items_to_copy,
         )
+
+@click.pass_context
+def get_repo_tags(ctx: click.Context, repo_name: str) -> List[str]:
+    """
+    Get all tags for a given repository
+    """
+    cmd = ["skopeo",
+           "list-tags",
+           f"docker://{repo_name}",
+           f"--override-os={ctx.obj.override_os}"]
+    if ctx.obj.override_arch != "all":
+        cmd = cmd + [f"--override-arch={ctx.obj.override_arch}"]
+    output = subprocess.check_output(cmd)
+    all_tags = json.loads(output)["Tags"]
+    
+    return all_tags
 
 
 def copy_image(ctx: Context, source_image, dest_image, token, sleep_time):
@@ -168,12 +258,16 @@ def copy_image(ctx: Context, source_image, dest_image, token, sleep_time):
     args = [
         "skopeo",
         "copy",
-        "--src-creds=grizmin:tainoobichamazis17:)",
         f"--dest-creds={token}",
         f"docker://{source_image}",
         f"docker://{dest_image}",
-        f"--override-os={ctx.override_os}",
+        f"--override-os={ctx.override_os}"
     ]
+    
+    if ctx.docker_username and ctx.docker_password:
+        args.insert(2, f"--src-creds={ctx.docker_username}:{ctx.docker_password}")
+    if ctx.dry_run:
+        args = args + ["--dry-run"]
     if ctx.override_arch == "all":
         args = args + [f"--multi-arch=all"]
     else:
@@ -187,19 +281,12 @@ def copy_image(ctx: Context, source_image, dest_image, token, sleep_time):
     time.sleep(sleep_time)
 
 
-@click.pass_context
-def find_tags_to_copy(ctx, image_name, tag_patterns, ignore_tags):
+
+def find_tags_to_copy(image_name, tag_patterns, ignore_tags):
     """
     Use Skopeo to list all available tags for an image
     """
-    cmd = ["skopeo",
-           "list-tags",
-           f"docker://{image_name}",
-           f"--override-os={ctx.obj.override_os}"]
-    if ctx.obj.override_arch != "all":
-        cmd = cmd + [f"--override-arch={ctx.obj.override_arch}"]
-    output = subprocess.check_output(cmd)
-    all_tags = json.loads(output)["Tags"]
+    all_tags = get_repo_tags(image_name)
 
     def does_match(tag):
         any_matches = any(fnmatch.fnmatch(tag, pattern) for pattern in tag_patterns)
