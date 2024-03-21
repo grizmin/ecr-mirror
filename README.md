@@ -6,7 +6,7 @@
 
 Mirror public docker images to ECR, automagically. This requires [Skopeo](https://github.com/containers/skopeo) to be installed.
 
-`pip install ecr-mirror`
+`pip install ecr-sync`
 
 ## Usage
 
@@ -63,6 +63,6 @@ Running `ecr-sync sync` will begin concurrently fetching matched images tags and
 
 You can run `ecr-sync list-repos` to see all repositories that will be mirrored.
 
-You can also manually copy specific image patterns using `ecr-mirror copy`:
+You can also manually copy specific image patterns using `ecr-sync copy`:
 
-`ecr-mirror copy "istio/proxyv2:1.6.*" ACCOUNT_ID.dkr.ecr.eu-west-1.amazonaws.com/istio-proxyv2`
+`ecr-sync copy "istio/proxyv2:1.6.*" ACCOUNT_ID.dkr.ecr.eu-west-1.amazonaws.com/istio-proxyv2`
