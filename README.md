@@ -1,8 +1,8 @@
 # Docker ECR Sync
 
 ![](https://img.shields.io/pypi/v/ecr_sync.svg)
-![](https://img.shields.io/pypi/l/ecr_sync_.svg)
-![](https://img.shields.io/pypi/pyversions/ecr_sync_.svg)
+![](https://img.shields.io/pypi/l/ecr_sync.svg)
+![](https://img.shields.io/pypi/pyversions/ecr_sync.svg)
 
 Mirror public docker images to ECR, automagically. This requires [Skopeo](https://github.com/containers/skopeo) to be installed.
 

@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "ecr_sync"
-version = "2.0.0"
+version = "2.0.1"
 license = "MIT"
 description = "Mirror and synchronize OCI Docker images to ECR repositories"
 authors = ["Tom Forbes <tom.forbes@onfido.com>", "Konstantin Krastev <grizmin@gmail.com>"]
